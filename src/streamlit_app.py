@@ -301,6 +301,7 @@ st.markdown("""
   <div class='eyebrow'>Self-Reviewing Retrieval Agent</div>
   <h1>The Reviewer's Desk</h1>
 </div>
+""", unsafe_allow_html=True)
 
 
 client = load_client()
