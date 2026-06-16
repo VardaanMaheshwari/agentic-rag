@@ -1,9 +1,3 @@
-
-
-
-
-
-
 import streamlit as st
 import sqlite3, os, re, tempfile
 from langchain_chroma import Chroma
@@ -246,45 +240,130 @@ def recent_lessons(limit=3):
         rows = conn.execute("SELECT query,issue,fix FROM lessons ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [{"query": r[0], "issue": r[1], "fix": r[2]} for r in rows]
 
-def reflect(query, answer, score, client):
-    prompt = (f"The answer scored {score:.2f}/1.0 for faithfulness. "
-              f"Diagnose the issue in one sentence and suggest one fix. "
-              f"Format exactly:\nIssue: ...\nFix: ...\n\nQuestion: {query}\nAnswer: {answer}")
+# ---------- DECISION 1: triage the question, choose a retrieval strategy ----------
+def triage(query, client):
+    prompt = (
+        "Classify the user's question into ONE category and reply with only that word:\n"
+        "- factual: asks for a specific fact, name, number, or definition\n"
+        "- reasoning: asks to explain, compare, or synthesize across the document\n"
+        "- unanswerable: asks for predictions, opinions, costs, or info a document is unlikely to contain\n\n"
+        f"Question: {query}\n\nCategory:"
+    )
+    raw = generate(prompt, client).strip().lower()
+    if "unanswer" in raw: kind = "unanswerable"
+    elif "reason" in raw:  kind = "reasoning"
+    else:                  kind = "factual"
+    # strategy: factual -> precise/narrow, reasoning -> broad, unanswerable -> moderate
+    k = {"factual": 4, "reasoning": 8, "unanswerable": 6}[kind]
+    return kind, k
+
+# ---------- The query rewriter (an ACTION the agent can choose) ----------
+def rewrite_query(query, issue, client):
+    prompt = (
+        "Rewrite the question to retrieve better from a document search. "
+        "Use specific, content-bearing terms; keep it one line; do not answer it.\n"
+        f"Problem with the last attempt: {issue}\n"
+        f"Original question: {query}\n\nRewritten question:"
+    )
+    out = generate(prompt, client).strip().split("\n")[0]
+    return out if out else query
+
+# ---------- DECISION 2: diagnose the failure AND choose a corrective action ----------
+def diagnose(query, answer, score, client):
+    prompt = (
+        "An answer scored low for faithfulness/relevance. Diagnose the cause and pick ONE fix.\n"
+        "Reply in exactly three lines:\n"
+        "Issue: <one sentence>\n"
+        "Action: <one of: rewrite_query | widen_retrieval | regenerate>\n"
+        "Fix: <one sentence>\n\n"
+        f"Question: {query}\nAnswer: {answer}\nScore: {score}"
+    )
     diag = generate(prompt, client)
-    issue, fix = "answer weakly grounded in context", "retrieve more context and restrict claims"
+    issue = "answer weakly grounded in context"
+    fix   = "retrieve more context and restrict claims"
+    action = "widen_retrieval"
     for line in diag.splitlines():
-        low = line.lower()
-        if low.startswith("issue:"): issue = line.split(":",1)[1].strip()
-        elif low.startswith("fix:"): fix = line.split(":",1)[1].strip()
-    return issue, fix
+        low = line.lower().strip()
+        if low.startswith("issue:"):  issue  = line.split(":",1)[1].strip()
+        elif low.startswith("fix:"):  fix    = line.split(":",1)[1].strip()
+        elif low.startswith("action:"):
+            a = line.split(":",1)[1].strip().lower()
+            if "rewrite" in a:   action = "rewrite_query"
+            elif "regen" in a:   action = "regenerate"
+            else:                action = "widen_retrieval"
+    return issue, action, fix
+
+# ---------- DECISION 3: decide whether to continue, stop, or give up ----------
+def decide_next(score, retries, kind):
+    if score >= SCORE_THRESHOLD:
+        return "done"
+    if kind == "unanswerable" and retries >= 1:
+        return "give_up"      # don't loop on questions the doc can't answer
+    if retries >= MAX_RETRIES:
+        return "give_up"
+    return "retry"
 
 def run_agent(query, retriever, client):
-    """Full loop: memory -> retrieve -> generate -> judge -> (reflect+retry). Writes lessons."""
+    """Goal-directed loop with 3 decision points: triage, action-selection, stop."""
     init_db()
     lessons = recent_lessons()
-    trace = [{"node":"memory_check","detail":f"{len(lessons)} prior lessons"}]
+    trace = [{"node":"memory_check","detail":f"loaded {len(lessons)} prior lessons"}]
+
+    # DECISION 1 — triage
+    kind, k = triage(query, client)
+    trace.append({"node":"triage","detail":f"classified as '{kind}' -> retrieval k={k}"})
+
+    active_query = query
     retries = 0
-    k = 6  # start broad to reduce retrieval misses
+    force_regen = False
     while True:
-        ctx = retrieve(query, retriever, k=k)
-        trace.append({"node":"retrieve","detail":f"{len(ctx)} chunks (k={k})"})
+        ctx = retrieve(active_query, retriever, k=k)
+        trace.append({"node":"retrieve","detail":f"{len(ctx)} chunks (k={k}) for: {active_query[:60]}"})
+
         hint = ""
         if lessons:
             hint = "\n\nPast lessons:\n" + "\n".join([f"- {l['issue']} -> {l['fix']}" for l in lessons])
-        prompt = f"Answer using only the context below.{hint}\n\nContext:\n{chr(10).join(ctx)}\n\nQuestion: {query}"
+        strict = "\nAnswer ONLY from the context. If it is not present, say so plainly." if force_regen else ""
+        prompt = f"Answer using only the context below.{hint}{strict}\n\nContext:\n{chr(10).join(ctx)}\n\nQuestion: {query}"
         answer = generate(prompt, client)
         trace.append({"node":"generate","detail":"draft written"})
+
         score = judge_score(answer, query, ctx, client)
         trace.append({"node":"judge","detail":f"score = {score}"})
-        if score >= SCORE_THRESHOLD or retries >= MAX_RETRIES:
+
+        # DECISION 3 — stop / retry / give up
+        decision = decide_next(score, retries, kind)
+        if decision == "done":
+            trace.append({"node":"decide","detail":"answer accepted (>= threshold)"})
             break
-        issue, fix = reflect(query, answer, score, client)
+        if decision == "give_up":
+            why = "max retries reached" if retries >= MAX_RETRIES else "question not answerable from document"
+            trace.append({"node":"decide","detail":f"stopping: {why}"})
+            break
+
+        # DECISION 2 — diagnose + choose corrective action
+        issue, action, fix = diagnose(query, answer, score, client)
         save_lesson(query, issue, fix, score, 0.0)
-        trace.append({"node":"reflect","detail":f"Issue: {issue} | Fix: {fix}"})
+        trace.append({"node":"reflect","detail":f"Issue: {issue}"})
+        trace.append({"node":"decide_action","detail":f"chose: {action}"})
+
+        # apply the chosen action
+        force_regen = False
+        if action == "rewrite_query":
+            active_query = rewrite_query(query, issue, client)
+            trace.append({"node":"rewrite_query","detail":f"new query: {active_query[:60]}"})
+        elif action == "widen_retrieval":
+            k = min(k + 4, 12)
+            trace.append({"node":"widen_retrieval","detail":f"k -> {k}"})
+        elif action == "regenerate":
+            force_regen = True
+            trace.append({"node":"regenerate","detail":"stricter grounding prompt"})
+
         retries += 1
-        k = 10  # widen retrieval on retry
         lessons = recent_lessons()
-    return {"query":query, "answer":answer, "score":score, "context":ctx, "retries":retries, "trace":trace}
+
+    return {"query":query, "answer":answer, "score":score, "context":ctx,
+            "retries":retries, "trace":trace, "kind":kind}
 
 def score_hex(s):
     if s>=0.7: return "#128a6b"
@@ -301,8 +380,8 @@ st.markdown("""
   <div class='eyebrow'>Self-Reviewing Retrieval Agent</div>
   <h1>The Reviewer's Desk</h1>
 </div>
+<div class='dek'>LangGraph · Llama-3.3-70B via Groq · ChromaDB · SQLite memory — the agent grades its own answers and learns from the misses</div>
 """, unsafe_allow_html=True)
-
 
 client = load_client()
 active_retriever = st.session_state.get("user_retriever") or load_prebuilt_retriever()
@@ -355,10 +434,13 @@ with tab2:
     if "last" in st.session_state:
         d = st.session_state["last"]
         st.markdown(f"<div class='sectlabel'>Question</div>{d['query']}", unsafe_allow_html=True)
-        st.markdown("<div class='sectlabel'>Pipeline</div>", unsafe_allow_html=True)
-        steps = [("memory_check","loaded prior lessons"),("retrieve",f"{len(d['context'])} chunks"),
-                 ("generate","draft written"),("judge",f"score = {d['score']}")]
-        log = "".join([f"<div class='logline'><span class='lognode'>{n}</span><span>{t}</span></div>" for n,t in steps])
+        kind = d.get("kind","")
+        if kind:
+            st.markdown(f"<div class='sectlabel'>Decision path · triaged as {kind}</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='sectlabel'>Decision path</div>", unsafe_allow_html=True)
+        trace = d.get("trace", [])
+        log = "".join([f"<div class='logline'><span class='lognode'>{step['node']}</span><span>{step['detail']}</span></div>" for step in trace])
         st.markdown(log, unsafe_allow_html=True)
         st.markdown("<div class='sectlabel'>Retrieved context</div>", unsafe_allow_html=True)
         for i,ch in enumerate(d["context"]):
