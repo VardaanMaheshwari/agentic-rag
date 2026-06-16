@@ -380,7 +380,6 @@ st.markdown("""
   <div class='eyebrow'>Self-Reviewing Retrieval Agent</div>
   <h1>The Reviewer's Desk</h1>
 </div>
-<div class='dek'>LangGraph · Llama-3.3-70B via Groq · ChromaDB · SQLite memory — the agent grades its own answers and learns from the misses</div>
 """, unsafe_allow_html=True)
 
 client = load_client()
