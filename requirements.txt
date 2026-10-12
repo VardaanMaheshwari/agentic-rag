@@ -10,3 +10,5 @@ plotly
 streamlit
 langgraph
 tavily-python
+
+rank_bm25
