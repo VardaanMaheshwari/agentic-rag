@@ -8,3 +8,5 @@ sentence-transformers==5.5.1
 groq
 plotly
 streamlit
+langgraph
+tavily-python
